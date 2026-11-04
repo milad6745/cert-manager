@@ -1,0 +1,84 @@
+name: cert-manager offline bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'cert-manager release tag (example: v1.21.3)'
+        required: true
+        default: 'v1.21.3'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout helper files
+        uses: actions/checkout@v4
+      - name: Download OCI Helm chart and build metadata
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid version'; exit 1; }
+          mkdir -p output/chart
+          helm pull oci://quay.io/jetstack/charts/cert-manager --version "$VERSION" --destination output/chart
+          mv "output/chart/cert-manager-${VERSION}.tgz" output/chart/cert-manager-chart.tgz
+          helm show values output/chart/cert-manager-chart.tgz > output/chart/default-values.yaml
+          helm show chart output/chart/cert-manager-chart.tgz > output/chart/chart-info.yaml
+          helm template cert-manager output/chart/cert-manager-chart.tgz \
+            --namespace cert-manager --set crds.enabled=true > output/chart/rendered.yaml
+          printf '%s\n' 'quay.io/jetstack/cert-manager-controller' 'quay.io/jetstack/cert-manager-webhook' \
+            'quay.io/jetstack/cert-manager-cainjector' 'quay.io/jetstack/cert-manager-startupapicheck' \
+            'quay.io/jetstack/cert-manager-acmesolver' | sed "s|$|:${VERSION}|" > output/chart/images.txt
+          grep -oE 'image: [^ ]+' output/chart/rendered.yaml | sort -u > output/chart/rendered-images.txt || true
+          (cd output/chart && sha256sum cert-manager-chart.tgz default-values.yaml chart-info.yaml rendered.yaml images.txt rendered-images.txt > SHA256SUMS.txt)
+          echo "Version: $VERSION" > output/chart/README.txt
+          echo 'Kubernetes 1.37 is NOT in the officially tested/supported matrix for cert-manager v1.21.' >> output/chart/README.txt
+      - name: Upload chart and manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: cert-manager-chart-and-metadata
+          path: output/chart/
+          if-no-files-found: error
+          retention-days: 30
+
+  images:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+          - cert-manager-controller
+          - cert-manager-webhook
+          - cert-manager-cainjector
+          - cert-manager-startupapicheck
+          - cert-manager-acmesolver
+    steps:
+      - name: Pull amd64 image, save tar, and hash
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid version'; exit 1; }
+          mkdir -p output
+          IMAGE="quay.io/jetstack/${COMPONENT}:${VERSION}"
+          docker pull --platform linux/amd64 "$IMAGE"
+          docker image inspect "$IMAGE" --format '{{json .RepoDigests}}' > output/repo-digests.json
+          docker save -o "output/${COMPONENT}.tar" "$IMAGE"
+          printf '%s\n' "$IMAGE" > output/source-image.txt
+          (cd output && sha256sum "${COMPONENT}.tar" repo-digests.json source-image.txt > SHA256SUMS.txt)
+      - name: Upload one image per artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.component }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
